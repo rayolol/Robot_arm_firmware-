@@ -27,6 +27,10 @@ where I2C: embedded_hal::i2c::I2c
 
     pub fn select_channel(&mut self, i2c: &mut I2C, channel: u8, delay: fn()) -> Result<(), ()> 
     {
+        if !self.rst_mux.is_set_low() {
+            self.rst_mux.set_low();
+        }
+
         if channel > 7 {
             return Err(());
         }

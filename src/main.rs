@@ -72,6 +72,7 @@ mod app {
         sender: Sender<'static, (u8,u32 ), 8>,
         receiver: Receiver<'static, (u8, u32), 8>,
         tca: TCA9548A<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>,
+        master_serial: Serial<pac::USART2, (Tx<pac::USART2>, Rx<pac::USART2>)>,
 
     }
 
@@ -117,6 +118,9 @@ mod app {
             let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
         let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
         let mut i2c = I2c::new(ctx.device.I2C1, (scl, sda), Mode::Standard { frequency: 10u32.kHz().into() }, &mut rcc);
+
+        let rx2 = gpioa.pa3.into_floating_input(&mut gpioa.crl);
+        let tx2 = gpioa.pa2.into_alternate_push_pull(&mut gpioa.crl);
 
         let mut tca: TCA9548A<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>> = TCA9548A::new(rst_mux);
 
@@ -223,6 +227,10 @@ rprintln!("I2C live probe end");
 
         let serial = HalfDuplexSerial::new(100000, delay);
 
+        let config = Config::default()
+            .baudrate(115_200.bps());
+        let master_serial = Serial::new(ctx.device.USART2,(tx2, rx2),config , &mut rcc);
+
         // Pre-initialize encoder queues for all encoders
         let mut encoder_value: LinearMap<u8, Queue<(f32, u16), 8>, 6> = LinearMap::new();
         for i in 0..6 {
@@ -304,6 +312,7 @@ rprintln!("I2C live probe end");
                 receiver,
                 i2c,
                 tca,
+                master_serial,
             },
     )
     }
@@ -338,6 +347,28 @@ rprintln!("I2C live probe end");
         }
     }
 
+    #[task(binds = USART2, local = [master_serial, rx_buffer: [u8; 4] = [0; 4], rx_index: usize = 0], shared = [motors, encoders], priority = 3)]
+    fn master_serial_task(mut ctx: master_serial_task::Context) {
+        // clear interrupt flag
+
+        if let Ok(byte) = ctx.local.master_serial.read(){
+            rprintln!("Received byte: {:02x}", byte);
+            ctx.local.rx_buffer[*ctx.local.rx_index] = byte;
+            *ctx.local.rx_index += 1;
+        }
+
+        if *ctx.local.rx_index > 4 {
+            rprintln!("Full command received: {:02x?}", &ctx.local.rx_buffer[..*ctx.local.rx_index]);
+            ctx.local.master_serial.write(b'A').ok();
+        }
+
+
+
+
+
+
+    }
+
 
     #[task(binds = TIM3,local = [last_time : u32 = 0, counter: u32 = 0, i2c, led, change_counter: u32 = 0, state: u8 = 0, timer3, sender, receiver, tca],  shared = [motors, encoders], priority = 2)]
     fn motor_velocity(mut ctx: motor_velocity::Context) {
@@ -355,6 +386,10 @@ rprintln!("I2C live probe end");
             *ctx.local.counter = 0;
         }
         
+        let command = ctx.local.receiver.try_recv().ok();
+        if let Some((id, angle)) = command {
+            rprintln!("got command for encoder {}: angle {}", id, angle);
+        }
 
 
 
