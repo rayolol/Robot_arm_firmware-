@@ -94,6 +94,12 @@ impl Motor {
     }
 
     pub fn set_velocity(&mut self, velocity: f32) -> Result<(), ()> {
+        // Check for NaN or infinite values
+        if !velocity.is_finite() {
+            rprintln!("[{}] ERROR: velocity is NaN or infinite: {}", self.name, velocity);
+            return Err(());
+        }
+
         let velocity_clamped = velocity.clamp(-self.config.max_velocity, self.config.max_velocity);
         self.target_velocity = velocity_clamped;
         rprintln!("[{}] target vel {}", self.name, velocity_clamped);

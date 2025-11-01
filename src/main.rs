@@ -72,7 +72,7 @@ mod app {
         sender: Sender<'static, (u8,u32 ), 8>,
         receiver: Receiver<'static, (u8, u32), 8>,
         tca: TCA9548A<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>,
-        master_serial: Serial<pac::USART2, (Tx<pac::USART2>, Rx<pac::USART2>)>,
+        master_serial: stm32f1xx_hal::serial::Serial<pac::USART2>,
 
     }
 
@@ -123,6 +123,15 @@ mod app {
         let tx2 = gpioa.pa2.into_alternate_push_pull(&mut gpioa.crl);
 
         let mut tca: TCA9548A<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>> = TCA9548A::new(rst_mux);
+        rprintln!("Resetting TCA9548A...");
+        tca.reset(|| {cortex_m::asm::delay(100000);});
+        rprintln!("TCA9548A reset complete");
+
+        // Test TCA by selecting channel 0
+        match tca.select_channel(&mut i2c, 0, || {cortex_m::asm::delay(100000);}) {
+            Ok(_) => rprintln!("TCA channel 0 selected successfully"),
+            Err(_) => rprintln!("ERROR: Failed to select TCA channel 0"),
+        }
 
         
 
@@ -159,8 +168,8 @@ for attempt in 0..200 {
                 rprintln!("probe {}: TCA OK, AS5600 no ack", attempt);
             }
         }
-        Err(_) => {
-            rprintln!("probe {}: TCA write FAILED", attempt);
+        Err(err) => {
+            rprintln!("probe {}: TCA write FAILED: {:?}", attempt, err);
         }
     }
     // small pause between attempts
@@ -357,25 +366,25 @@ rprintln!("I2C live probe end");
             *ctx.local.rx_index += 1;
         }
 
-        if *ctx.local.rx_index > 4 {
+        if *ctx.local.rx_index >= 4 {
             rprintln!("Full command received: {:02x?}", &ctx.local.rx_buffer[..*ctx.local.rx_index]);
-            ctx.local.master_serial.write(b'A').ok();
+            *ctx.local.rx_index = 0;
+            ctx.local.master_serial.write(b'O').unwrap();
+            
         }
-
-
-
-
-
-
     }
 
 
-    #[task(binds = TIM3,local = [last_time : u32 = 0, counter: u32 = 0, i2c, led, change_counter: u32 = 0, state: u8 = 0, timer3, sender, receiver, tca],  shared = [motors, encoders], priority = 2)]
+    #[task(binds = TIM3,local = [last_time : u32 = 0,last_angle: u16 = 0, counter: u32 = 0, i2c, led, change_counter: u32 = 0, state: u8 = 0, timer3, sender, receiver, tca],  shared = [motors, encoders], priority = 2)]
     fn motor_velocity(mut ctx: motor_velocity::Context) {
         ctx.local.timer3.clear_interrupt(Event::Update);
 
-        let now = Mono::now().duration_since_epoch().to_secs() as u32;
-        let dt = (now - *ctx.local.last_time) as f32;
+        let now = Mono::now().duration_since_epoch().to_micros() as u32;
+        let dt = if *ctx.local.last_time == 0 {
+            0.00002 // 20 microseconds (timer period) on first call
+        } else {
+            (now - *ctx.local.last_time) as f32 / 1_000_000.0 // Convert microseconds to seconds
+        };
 
         *ctx.local.last_time = now;
 
@@ -399,18 +408,21 @@ rprintln!("I2C live probe end");
                 ctx.shared.motors.lock(|m| {
                     for (_name, (mt, pid)) in m.iter_mut() {
                             let target_vel = 200.0;
-                            let mut updated = 0.0;
-                            ctx.local.tca.select_channel(ctx.local.i2c, mt.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}).ok();
-                            // rprintln!("velo set to 200");
-                            if let Some(id) = mt.encoder_id {
+
+                            if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, mt.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
+                                rprintln!("Failed to select TCA channel {}", mt.encoder_id.unwrap_or(0));
+                            }
+
+                            let pid_output = if let Some(id) = mt.encoder_id {
                                 let data = ctx.shared.encoders.lock(|encoders| {
                                     let encoder = &mut encoders[id as usize];
-                                    let data: (f32, u16) = match encoder.read_angle(ctx.local.i2c) {
+                                    let data  = match encoder.read_angle(ctx.local.i2c) {
                                         Ok(angle) => {
                                             rprintln!("Encoder {} angle: {}", id, angle);
-                                            let angle1 = encoder.read_angle(ctx.local.i2c).unwrap_or(0);
-                                            let angle2 = encoder.read_angle(ctx.local.i2c).unwrap_or(0);
-                                            let speed = (angle2 - angle1) as f32 / dt;
+                                            // Calculate speed BEFORE updating last_angle
+                                            let angle_diff = (angle as i32 - *ctx.local.last_angle as i32) as f32;
+                                            let speed = angle_diff / dt; // counts per second
+                                            *ctx.local.last_angle = angle; // Now update for next iteration
                                             (speed, angle)
                                         }
                                         Err(e) => {
@@ -418,18 +430,18 @@ rprintln!("I2C live probe end");
                                             (0.0, 0)}
                                     };
                                     rprintln!("Encoder {} speed: {}", id, data.0);
-                                    rprintln!("pid updated: {}", updated);
                                     data
                                 });
-                                updated = pid.update(target_vel, data.0, dt);
-                                mt.set_velocity(updated).ok();
+                                let output = pid.update(target_vel, data.0, dt);
+                                rprintln!("PID output: {}", output);
+                                output
                             } else {
-                                rprintln!("no encoder for motor {}", mt.name);                                 
-                                updated = target_vel;
-                            }
+                                rprintln!("no encoder for motor {}", mt.name);
+                                target_vel
+                            };
 
-                           rprintln!("target vel {}", mt.target_velocity);
-                            let _ = mt.set_velocity(updated);                            
+                            rprintln!("Setting motor velocity to: {}", pid_output);
+                            let _ = mt.set_velocity(pid_output);
                         }
                     });                
         ctx.shared.motors.lock(|m| {

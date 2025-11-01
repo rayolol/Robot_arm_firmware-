@@ -1,4 +1,3 @@
-use stm32f1xx_hal::pac::otg_fs_host::hc::int;
 
 #[derive(Clone)]
 pub struct PidController {
@@ -26,12 +25,17 @@ impl PidController {
             last_error: 0.0,
             derivative_error: 0.0,
             output_max: 300.0,
-            output_min: 300.0,
+            output_min: -300.0,  // Fixed: should be negative!
             integral_min: -100.0,
             integral_max: 100.0,
         }
     }
     pub fn update(&mut self, setpoint: f32, measurement: f32, dt: f32) -> f32 {
+        // Check for invalid inputs
+        if !setpoint.is_finite() || !measurement.is_finite() || !dt.is_finite() || dt <= 0.0 {
+            return 0.0; // Return safe value on invalid input
+        }
+
         let error = setpoint - measurement;
         self.integral_error += error * dt;
         self.integral_error = self.integral_error.clamp(self.integral_min, self.integral_max);
@@ -39,10 +43,10 @@ impl PidController {
         self.derivative_error = (error - self.last_error) / dt;
 
         self.last_error = error;
-        
 
-        let error: f32 = (self.kp * error) + (self.ki * self.integral_error) + (self.kd * self.derivative_error);
-        error.clamp(self.output_min, self.output_max)
+
+        let output: f32 = (self.kp * error) + (self.ki * self.integral_error) + (self.kd * self.derivative_error);
+        output.clamp(self.output_min, self.output_max)
     }
     pub fn reset(&mut self) {
         self.integral_error = 0.0;
