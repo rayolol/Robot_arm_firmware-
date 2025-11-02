@@ -100,7 +100,7 @@ where I2C: embedded_hal::i2c::I2c
             _phantom: core::marker::PhantomData,
         }
     }
-    
+
     /// Get the multiplexer channel
     pub fn mux_channel(&self) -> u8 {
         self.mux_channel
