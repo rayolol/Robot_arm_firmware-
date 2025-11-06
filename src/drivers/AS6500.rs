@@ -1,9 +1,7 @@
 // drivers/as5600/driver.rs
 // AS5600 magnetic rotary encoder driver
-use crate::config::{AS5600_I2C_ADDR, ENCODER_RESOLUTION, ENCODER_TO_DEGREES, TCA9548A_I2C_ADDR};
-use rtt_target::rprintln;
+use crate::config::{AS5600_I2C_ADDR, ENCODER_RESOLUTION, ENCODER_TO_DEGREES};
 // AS5600 REGISTER MAP
-use core::sync::atomic::{AtomicI8, Ordering};
 
 // global cached selected channel: -1 = none
 
@@ -75,7 +73,6 @@ pub struct As5600<I2C> {
 
     /// Last known good angle (for velocity calculation)
     last_angle: u16,
-    current_mux_channel: u8,
 
     /// Number of full rotations (for multi-turn tracking)
     rotations: i32,
@@ -95,11 +92,11 @@ where I2C: embedded_hal::i2c::I2c
         Self {
             mux_channel,
             last_angle: 0,
-            current_mux_channel: mux_channel,
             rotations: 0,
             _phantom: core::marker::PhantomData,
         }
     }
+
 
     /// Get the multiplexer channel
     pub fn mux_channel(&self) -> u8 {

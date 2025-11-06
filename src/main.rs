@@ -48,15 +48,17 @@ mod app {
     use rtic_sync::{channel::*, make_channel};
 
 
+    use crate::control::parts::{EndEffector, ControlMode, ControlLoop};
+
     use super::*;
 
     #[shared]
     struct Shared {
         command_queue: Queue<(u8, MotorCommand), 8>,
-        motors: LinearMap<&'static str, (MT, PidController), 6>,
         response_queue: Queue<(u8, MotorResponse), 8>,
         encoder_value: LinearMap<u8, Queue<(f32, u16), 8>, 6>,
         encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6],
+        end_effector: EndEffector,
 
 
     }
@@ -64,7 +66,7 @@ mod app {
     #[local]
     struct Local {
         half_serial: HalfDuplexSerial,
-        timer: CounterHz<pac::TIM2>,
+        timer: CounterUs<pac::TIM2>,
         timer3: CounterUs<pac::TIM3>,
         led: PC13<Output<PushPull>>,
         drivers: [TmcDriver; 4],
@@ -127,16 +129,11 @@ mod app {
         tca.reset(|| {cortex_m::asm::delay(100000);});
         rprintln!("TCA9548A reset complete");
 
-        // Test TCA by selecting channel 0
-        match tca.select_channel(&mut i2c, 0, || {cortex_m::asm::delay(100000);}) {
-            Ok(_) => rprintln!("TCA channel 0 selected successfully"),
-            Err(_) => rprintln!("ERROR: Failed to select TCA channel 0"),
-        }
-
+        
         
 
-        // let step_pin1 =  gpiob.pb0.into_push_pull_output(&mut gpiob.crl).erase();
-        // let dir_pin1 = gpiob.pb13.into_push_pull_output(&mut gpiob.crh).erase();
+        let step_pin1 =  gpiob.pb0.into_push_pull_output(&mut gpiob.crl).erase();
+        let dir_pin1 = gpiob.pb13.into_push_pull_output(&mut gpiob.crh).erase();
 
         // let step_pin2 = gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
         // let dir_pin2 = gpiob.pb14.into_push_pull_output(&mut gpiob.crh).erase();
@@ -156,7 +153,7 @@ mod app {
 for attempt in 0..200 {
     // try write to TCA (select channel 0)
     let channel_byte = 1u8; // select channel 0
-    match i2c.write(crate::config::TCA9548A_I2C_ADDR, &[channel_byte]) {
+    match tca.select_channel(&mut i2c, channel_byte, || {cortex_m::asm::delay(100000);}) {
         Ok(()) => {
             // small settle
             cortex_m::asm::delay(72_000);
@@ -195,8 +192,9 @@ rprintln!("I2C live probe end");
         usart3.brr().write(|w| unsafe { w.bits(3750) });
 
         rprintln!("init timer");
-        let mut timer = ctx.device.TIM2.counter_hz(&mut rcc);
-        timer.start(100.Hz()).unwrap();
+       let mut timer = ctx.device.TIM2.counter_us(&mut rcc);
+        timer.start(10.micros()).unwrap();
+
         timer.listen(Event::Update);
 
         let delay= ctx.device.TIM4.delay_us(&mut rcc);
@@ -209,10 +207,9 @@ rprintln!("I2C live probe end");
         timer3.start(20.micros()).unwrap();
         timer3.listen(Event::Update);
 
-
             let mut m0 = MT::new(0,"motor 1", MotorType::Tmc(0), step_pin0, dir_pin0, cfg.clone(), 10, Some(0));
 
-            // let mut m1 = MT::new(1,"motor 2", MotorType::Tmc(1), step_pin1, dir_pin1, cfg.clone(), 20);
+            let mut m1 = MT::new(1,"motor 2", MotorType::Tmc(1), step_pin1, dir_pin1, cfg.clone(), 10, Some(1));
 
             // let mut m2 = MT::new(2,"motor 3",MotorType::Tmc(2), step_pin2, dir_pin2, cfg.clone(), 20);
 
@@ -222,13 +219,15 @@ rprintln!("I2C live probe end");
 
             // let mut m5 =MT::new(5,"motor 6",MotorType::Tb6600, step_pin5, dir_pin5, cfg.clone(), 20);
 
-            let mut motors: LinearMap<&'static str, (MT, PidController), 6> = LinearMap::new();
-
+            // Initialize motors
             m0.init(500.0).unwrap();
+            m1.init(500.0).unwrap();
+
+            // Create EndEffector - it owns the motors
+            let end_effector = EndEffector::new(m0, m1, pids[0 as usize].clone(), pids[1 as usize].clone(), 1.0, 1.0, ControlMode::Position(ControlLoop::Closed));
 
 
 
-            let _ = motors.insert(m0.name, (m0, pids[0 as usize].clone()));
             
     
         let command_queue = Queue::new();
@@ -301,14 +300,14 @@ rprintln!("I2C live probe end");
     }
 
 
-        
+
         (
             Shared {
                 response_queue,
                 command_queue,
-                motors,
                 encoder_value,
                 encoders,
+                end_effector,
 
             },
             Local {
@@ -326,18 +325,17 @@ rprintln!("I2C live probe end");
     )
     }
 
-   
 
-    #[task( binds = TIM2, local = [timer], shared = [motors], priority = 5)]
+
+    #[task( binds = TIM2, local = [timer], shared = [end_effector], priority = 5)]
     fn tmc_manager(mut ctx: tmc_manager::Context) {
         // Clear the interrupt flag
         ctx.local.timer.clear_interrupt(Event::Update);
-              
-        ctx.shared.motors.lock(|m| {
-            for (_name, (mt, _pid)) in m.iter_mut() {
-                mt.tick();
-            }
-        })      
+
+        // Tick all motors in the end effector
+        ctx.shared.end_effector.lock(|ee| {
+            ee.tick_motors();
+        })
     }
 
     #[task(local=[drivers, half_serial], shared = [command_queue, response_queue], priority = 1)]
@@ -356,8 +354,8 @@ rprintln!("I2C live probe end");
         }
     }
 
-    #[task(binds = USART2, local = [master_serial, rx_buffer: [u8; 4] = [0; 4], rx_index: usize = 0], shared = [motors, encoders], priority = 3)]
-    fn master_serial_task(mut ctx: master_serial_task::Context) {
+    #[task(binds = USART2, local = [master_serial, rx_buffer: [u8; 4] = [0; 4], rx_index: usize = 0], shared = [encoders], priority = 3)]
+    fn master_serial_task(ctx: master_serial_task::Context) {
         // clear interrupt flag
 
         if let Ok(byte) = ctx.local.master_serial.read(){
@@ -370,12 +368,12 @@ rprintln!("I2C live probe end");
             rprintln!("Full command received: {:02x?}", &ctx.local.rx_buffer[..*ctx.local.rx_index]);
             *ctx.local.rx_index = 0;
             ctx.local.master_serial.write(b'O').unwrap();
-            
+
         }
     }
 
 
-    #[task(binds = TIM3,local = [last_time : u32 = 0,last_angle: u16 = 0, counter: u32 = 0, i2c, led, change_counter: u32 = 0, state: u8 = 0, timer3, sender, receiver, tca],  shared = [motors, encoders], priority = 2)]
+    #[task(binds = TIM3,local = [last_time : u32 = 0,last_angle: u16 = 0, counter: u32 = 0, i2c, led, change_counter: u32 = 0, state: u8 = 0, timer3, sender, receiver, tca],  shared = [end_effector, encoders], priority = 2)]
     fn motor_velocity(mut ctx: motor_velocity::Context) {
         ctx.local.timer3.clear_interrupt(Event::Update);
 
@@ -391,10 +389,10 @@ rprintln!("I2C live probe end");
           *ctx.local.counter += 1;
         if *ctx.local.counter >= 50 {
             ctx.local.led.toggle();
-            
+
             *ctx.local.counter = 0;
         }
-        
+
         let command = ctx.local.receiver.try_recv().ok();
         if let Some((id, angle)) = command {
             rprintln!("got command for encoder {}: angle {}", id, angle);
@@ -405,51 +403,36 @@ rprintln!("I2C live probe end");
         *ctx.local.change_counter += 1;
 
         if *ctx.local.change_counter >= 100 {
-                ctx.shared.motors.lock(|m| {
-                    for (_name, (mt, pid)) in m.iter_mut() {
-                            let target_vel = 200.0;
+                ctx.shared.end_effector.lock(|ee| {
+                    // Access motor1 and motor2 directly
 
-                            if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, mt.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
-                                rprintln!("Failed to select TCA channel {}", mt.encoder_id.unwrap_or(0));
-                            }
+                    ee.set_pitch_roll(200.0, 200.0);
 
-                            let pid_output = if let Some(id) = mt.encoder_id {
-                                let data = ctx.shared.encoders.lock(|encoders| {
-                                    let encoder = &mut encoders[id as usize];
-                                    let data  = match encoder.read_angle(ctx.local.i2c) {
-                                        Ok(angle) => {
-                                            rprintln!("Encoder {} angle: {}", id, angle);
-                                            // Calculate speed BEFORE updating last_angle
-                                            let angle_diff = (angle as i32 - *ctx.local.last_angle as i32) as f32;
-                                            let speed = angle_diff / dt; // counts per second
-                                            *ctx.local.last_angle = angle; // Now update for next iteration
-                                            (speed, angle)
-                                        }
-                                        Err(e) => {
-                                            rprintln!("Encoder {} read error: {:?}", id, e);
-                                            (0.0, 0)}
-                                    };
-                                    rprintln!("Encoder {} speed: {}", id, data.0);
-                                    data
-                                });
-                                let output = pid.update(target_vel, data.0, dt);
-                                rprintln!("PID output: {}", output);
-                                output
-                            } else {
-                                rprintln!("no encoder for motor {}", mt.name);
-                                target_vel
-                            };
-
-                            rprintln!("Setting motor velocity to: {}", pid_output);
-                            let _ = mt.set_velocity(pid_output);
+                    // Handle motor1
+                    if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, ee.motor1.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
+                        rprintln!("Failed to select TCA channel {}", ee.motor1.encoder_id.unwrap_or(0));
+                    }
+                    let (angle1, angle2) = ctx.shared.encoders.lock(|encoders| {
+                        if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, ee.motor1.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
+                            rprintln!("Failed to select TCA channel {}", ee.motor1.encoder_id.unwrap_or(0));
                         }
-                    });                
-        ctx.shared.motors.lock(|m| {
-            for (_name, (mt,pid)) in m.iter_mut() {
-                let state = mt.update_from_ramp();
-                rprintln!("ramp updated: {:?}",state );
-            }
-        })
+                        let angle1 = encoders[ee.motor1.encoder_id.unwrap_or(0) as usize].read_angle_degrees(ctx.local.i2c).unwrap_or(0.0) as f32;
+                        if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, ee.motor2.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
+                            rprintln!("Failed to select TCA channel {}", ee.motor2.encoder_id.unwrap_or(0));
+                        }
+                        let angle2 = encoders[ee.motor2.encoder_id.unwrap_or(0) as usize].read_angle_degrees(ctx.local.i2c).unwrap_or(0.0) as f32;
+
+                        (angle1, angle2)
+                    });
+
+                    ee.update_position_control(Some(angle1), Some(angle2), Some(dt));
+                    
+                   
+
+                    let _ = ee.motor1.update_from_ramp();
+                    let _ = ee.motor2.update_from_ramp();
+
+                });
     }
 }
 
