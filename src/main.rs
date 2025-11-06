@@ -334,7 +334,13 @@ rprintln!("I2C live probe end");
 
         // Tick all motors in the end effector
         ctx.shared.end_effector.lock(|ee| {
-            ee.tick_motors();
+            let [m1_step, m2_step] = ee.tick_motors();
+            if m1_step {
+                let _ = ee.motor1.update_from_ramp();
+            }
+            if m2_step {
+                let _ = ee.motor2.update_from_ramp();
+            }
         })
     }
 
@@ -427,11 +433,6 @@ rprintln!("I2C live probe end");
 
                     ee.update_position_control(Some(angle1), Some(angle2), Some(dt));
                     
-                   
-
-                    let _ = ee.motor1.update_from_ramp();
-                    let _ = ee.motor2.update_from_ramp();
-
                 });
     }
 }

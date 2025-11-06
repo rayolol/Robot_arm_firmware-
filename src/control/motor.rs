@@ -216,22 +216,29 @@ impl Motor {
     }
 
     #[inline(always)]
-    pub fn tick(&mut self) {
-        if !self.enabled { return; }
-        if self.remaining_ticks > 0 { self.remaining_ticks -= 1; return; }
+    /// Called from the high-rate timer; returns true on the rising edge so callers
+    /// can fetch the next ramp interval exactly once per emitted step.
+    pub fn tick(&mut self) -> bool {
+        if !self.enabled { return false; }
+        if self.remaining_ticks > 0 {
+            self.remaining_ticks -= 1;
+            return false;
+        }
 
         self.step_pin_state = !self.step_pin_state;
         if self.step_pin_state {
             let _ = self.step_pin.set_high();
             self.current_position = self.current_position.wrapping_add(1);
+            self.remaining_ticks = self.interval_ticks;
+            true
         } else {
             let _ = self.step_pin.set_low();
+            self.remaining_ticks = self.interval_ticks;
+            false
         }
-        self.remaining_ticks = self.interval_ticks;
     }
 
     pub fn stop(&mut self) { self.target_velocity = 0.0; self.enabled = false; }
 }
-
 
 
