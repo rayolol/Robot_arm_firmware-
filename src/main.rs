@@ -18,7 +18,6 @@ use stm32f1xx_hal::{
     rcc,
 };
 use control::motor::{Motor as MT, MotorType, MotorConfig};
-use control::pid::PidController;    
 use drivers::TMC2209::{MotorCommand,MotorResponse, TmcDriver};
 use drivers::AS6500::{As5600, As5600Error, MagnetStatus};
 use drivers::TCA::TCA9548A;
@@ -29,6 +28,7 @@ const BAUD: u32 = 9_600;
 const BIT_CYCLES: u32 = SYSCLK_HZ / BAUD;       // ≈ 7500 cycles per bit (72MHz/9600)
 const BYTE_TIME_CYCLES: u32 = BIT_CYCLES * 10;  // 1 start + 8 data + 1 stop ≈ 75_000 cycles ~1.04 ms
 const BYTE_CYCLES: u32 = BIT_CYCLES * 10;        // start+8+stop ~75k cycles ~1.04ms
+const DEBUG_SPIN_MOTORS: bool = false;
 
 mod halfduplex;
 use halfduplex::HalfDuplexSerial;
@@ -46,6 +46,7 @@ mod app {
 
     use rtic_monotonics::{Monotonic, systick_monotonic};
     use rtic_sync::{channel::*, make_channel};
+    use stm32f1xx_hal::pac::crc::dr;
 
 
     use crate::control::parts::{EndEffector, ControlMode, ControlLoop};
@@ -71,8 +72,8 @@ mod app {
         led: PC13<Output<PushPull>>,
         drivers: [TmcDriver; 4],
         i2c: stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>,
-        sender: Sender<'static, (u8,u32 ), 8>,
-        receiver: Receiver<'static, (u8, u32), 8>,
+        sender: Sender<'static, (u8, MotorCommand), 8>,
+        receiver: Receiver<'static, (u8, MotorResponse), 8>,
         tca: TCA9548A<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>,
         master_serial: stm32f1xx_hal::serial::Serial<pac::USART2>,
 
@@ -92,12 +93,18 @@ mod app {
             &mut flash.acr
         );
 
-        let (sender, receiver) = make_channel!((u8, u32), 8);
+        // let (sender, receiver) = make_channel!((u8, u32), 8);
+        let (command_sender, command_receiver) = make_channel!((u8, MotorCommand), 8);
+        let (response_sender, response_receiver) = make_channel!((u8, MotorResponse), 8);
         
       
-        let drivers: [TmcDriver; 4] = core::array::from_fn(|i| TmcDriver::new(i as u8, 200, 256));
+        let mut drivers: [TmcDriver; 4] = core::array::from_fn(|i| TmcDriver::new(i as u8, 200, 256));
+        for driver in drivers.iter_mut() {
+            driver.enable().unwrap();
+        }
         let mut encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] = core::array::from_fn(|i| As5600::new(i as u8));
-        let pids: [control::pid::PidController; 6] = core::array::from_fn(|i| control::pid::PidController::new(1.0, 0.0, 0.0, i as u8));
+        encoders[1].set_invert(true);
+        let pids: [control::pid::PidController; 6] = core::array::from_fn(|i| control::pid::PidController::new(1.0, 0.1, 0.1, i as u8));
 
         rtt_init_print!();
         rprintln!("=====initializing RTIC========");
@@ -132,8 +139,8 @@ mod app {
         
         
 
-        let step_pin1 =  gpiob.pb0.into_push_pull_output(&mut gpiob.crl).erase();
-        let dir_pin1 = gpiob.pb13.into_push_pull_output(&mut gpiob.crh).erase();
+        let step_pin1 =  gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
+        let dir_pin1 = gpiob.pb14.into_push_pull_output(&mut gpiob.crh).erase();
 
         // let step_pin2 = gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
         // let dir_pin2 = gpiob.pb14.into_push_pull_output(&mut gpiob.crh).erase();
@@ -204,7 +211,7 @@ rprintln!("I2C live probe end");
 
         use rtic_monotonics::fugit::ExtU32;
         let mut timer3 = ctx.device.TIM3.counter_us(&mut rcc);
-        timer3.start(20.micros()).unwrap();
+        timer3.start(1000.micros()).unwrap();
         timer3.listen(Event::Update);
 
             let mut m0 = MT::new(0,"motor 1", MotorType::Tmc(0), step_pin0, dir_pin0, cfg.clone(), 10, Some(0));
@@ -299,6 +306,11 @@ rprintln!("I2C live probe end");
         }
     }
 
+    tmc_command_task::spawn(command_receiver, response_sender).unwrap();
+
+
+    configue_task::spawn(command_sender.clone()).unwrap();
+
 
 
         (
@@ -316,8 +328,8 @@ rprintln!("I2C live probe end");
                 timer3,
                 led,
                 drivers,
-                sender,
-                receiver,
+                sender: command_sender,
+                receiver: response_receiver,
                 i2c,
                 tca,
                 master_serial,
@@ -335,28 +347,38 @@ rprintln!("I2C live probe end");
         // Tick all motors in the end effector
         ctx.shared.end_effector.lock(|ee| {
             let [m1_step, m2_step] = ee.tick_motors();
-            if m1_step {
-                let _ = ee.motor1.update_from_ramp();
-            }
-            if m2_step {
-                let _ = ee.motor2.update_from_ramp();
+            if DEBUG_SPIN_MOTORS && (m1_step || m2_step) {
+                rprintln!("steps: m1={} m2={}", m1_step, m2_step);
             }
         })
     }
+    #[task( shared = [command_queue, response_queue], priority = 1)]
+    async fn configue_task(ctx: configue_task::Context, mut command_sender: Sender<'static, (u8, MotorCommand), 8>) {
+            command_sender.try_send((0, MotorCommand::GetStatus)).unwrap();
+            command_sender.try_send((0, MotorCommand::SetCurrent(1000))).unwrap();
+            command_sender.try_send((0, MotorCommand::SetMicrosteps(4))).unwrap();
+            command_sender.try_send((1, MotorCommand::GetStatus)).unwrap();
+            command_sender.try_send((1, MotorCommand::SetCurrent(1000))).unwrap();
+            command_sender.try_send((1, MotorCommand::SetMicrosteps(4))).unwrap();
+    }
 
-    #[task(local=[drivers, half_serial], shared = [command_queue, response_queue], priority = 1)]
-    async fn tmc_command_task(mut ctx: tmc_command_task::Context) {
-        let command = ctx.shared.command_queue.lock(|q| {
-            q.dequeue()
-        });
-        match command {
-            Some(cmd) => {
-                let response = ctx.local.drivers[cmd.0 as usize].execute(cmd.1, ctx.local.half_serial);
-                ctx.shared.response_queue.lock(|q| {
-                    let _ = q.enqueue((cmd.0, response));
-                });
+    #[task(local=[drivers, half_serial], shared = [command_queue, response_queue], priority = 7)]
+    async fn tmc_command_task(ctx: tmc_command_task::Context, mut command_sender: Receiver<'static, (u8, MotorCommand), 8>, mut response_sender: Sender<'static, (u8, MotorResponse), 8>) {
+        loop {
+            let command = command_sender.recv().await.ok();
+
+        
+            match command {
+                Some(cmd) => {
+                    rprintln!("got command for motor {}: {:?}", cmd.0, cmd.1);
+                    let response = ctx.local.drivers[cmd.0 as usize].execute(cmd.1, ctx.local.half_serial);
+                    response_sender.try_send((cmd.0, response)).ok();
+                    rprintln!("response sent {:?}", response);
+                }
+                None => {
+                    rprintln!("no command received in tmc_command_task");
+                }
             }
-            None => {}
         }
     }
 
@@ -379,16 +401,18 @@ rprintln!("I2C live probe end");
     }
 
 
-    #[task(binds = TIM3,local = [last_time : u32 = 0,last_angle: u16 = 0, counter: u32 = 0, i2c, led, change_counter: u32 = 0, state: u8 = 0, timer3, sender, receiver, tca],  shared = [end_effector, encoders], priority = 2)]
+    #[task(binds = TIM3,local = [last_time : u32 = 0,last_angle: u16 = 0,put:bool = true, counter: u32 = 0, i2c, led, change_counter: u32 = 0,sender, receiver, state: u8 = 0, timer3, tca, dbg_counter: u32 = 0, debug_ticks: u32 = 0, debug_dir: i8 = 1],  shared = [end_effector, encoders], priority = 2)]
     fn motor_velocity(mut ctx: motor_velocity::Context) {
         ctx.local.timer3.clear_interrupt(Event::Update);
 
         let now = Mono::now().duration_since_epoch().to_micros() as u32;
         let dt = if *ctx.local.last_time == 0 {
-            0.00002 // 20 microseconds (timer period) on first call
+            0.00002
         } else {
-            (now - *ctx.local.last_time) as f32 / 1_000_000.0 // Convert microseconds to seconds
+            let raw = (now - *ctx.local.last_time) as f32 / 1_000_000.0;
+            if raw <= 0.0 { 0.00002 } else { raw }
         };
+
 
         *ctx.local.last_time = now;
 
@@ -399,42 +423,78 @@ rprintln!("I2C live probe end");
             *ctx.local.counter = 0;
         }
 
-        let command = ctx.local.receiver.try_recv().ok();
-        if let Some((id, angle)) = command {
-            rprintln!("got command for encoder {}: angle {}", id, angle);
-        }
+
+
 
 
 
         *ctx.local.change_counter += 1;
 
+        if DEBUG_SPIN_MOTORS {
+            ctx.shared.end_effector.lock(|ee| {
+                let dir = if *ctx.local.debug_dir > 0 { 1.0 } else { -1.0 };
+                let speed = 120.0 * dir;
+                let _ = ee.motor1.set_velocity(speed);
+                let _ = ee.motor2.set_velocity(-speed);
+                *ctx.local.debug_ticks += 1;
+                if *ctx.local.debug_ticks >= 25_000 {
+                    *ctx.local.debug_ticks = 0;
+                    *ctx.local.debug_dir *= -1;
+                    rprintln!("[debug] reversing debug spin direction");
+                }
+            });
+            return;
+        }
+
         if *ctx.local.change_counter >= 100 {
-                ctx.shared.end_effector.lock(|ee| {
-                    // Access motor1 and motor2 directly
+            *ctx.local.change_counter = 0;
 
-                    ee.set_pitch_roll(200.0, 200.0);
+            let (motor1_encoder, motor2_encoder, target_angle1, target_angle2) = ctx.shared.end_effector.lock(|ee| {
+                (ee.motor1.encoder_id.unwrap_or(0), ee.motor2.encoder_id.unwrap_or(0), ee.target_angle1, ee.target_angle2)
+            });
+            rprintln!("[ctrl] encoder ids m1={} m2={}, targets ({:.3}, {:.3})", motor1_encoder, motor2_encoder, target_angle1, target_angle2);
 
-                    // Handle motor1
-                    if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, ee.motor1.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
-                        rprintln!("Failed to select TCA channel {}", ee.motor1.encoder_id.unwrap_or(0));
-                    }
-                    let (angle1, angle2) = ctx.shared.encoders.lock(|encoders| {
-                        if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, ee.motor1.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
-                            rprintln!("Failed to select TCA channel {}", ee.motor1.encoder_id.unwrap_or(0));
-                        }
-                        let angle1 = encoders[ee.motor1.encoder_id.unwrap_or(0) as usize].read_angle_degrees(ctx.local.i2c).unwrap_or(0.0) as f32;
-                        if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, ee.motor2.encoder_id.unwrap_or(0), || {cortex_m::asm::delay(100000);}) {
-                            rprintln!("Failed to select TCA channel {}", ee.motor2.encoder_id.unwrap_or(0));
-                        }
-                        let angle2 = encoders[ee.motor2.encoder_id.unwrap_or(0) as usize].read_angle_degrees(ctx.local.i2c).unwrap_or(0.0) as f32;
+            let (angle1, angle2) = ctx.shared.encoders.lock(|encoders| {
+                if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, motor1_encoder, || { cortex_m::asm::delay(100000); }) {
+                    rprintln!("Failed to select TCA channel {}", motor1_encoder);
+                }
+                let angle1 = encoders[motor1_encoder as usize].read_angle_degrees(ctx.local.i2c).unwrap_or(0.0) as f32;
 
-                        (angle1, angle2)
-                    });
+                if let Err(_) = ctx.local.tca.select_channel(ctx.local.i2c, motor2_encoder, || { cortex_m::asm::delay(100000); }) {
+                    rprintln!("Failed to select TCA channel {}", motor2_encoder);
+                }
+                let angle2 = encoders[motor2_encoder as usize].read_angle_degrees(ctx.local.i2c).unwrap_or(0.0) as f32;
 
-                    ee.update_position_control(Some(angle1), Some(angle2), Some(dt));
-                    
-                });
-    }
+                (angle1, angle2)
+            });
+            rprintln!("[enc] angles ({:.3}, {:.3})", angle1, angle2);
+
+            ctx.shared.end_effector.lock(|ee| {
+                if *ctx.local.put {
+                    ee.set_pitch_roll(0.0, 150.0);
+                    *ctx.local.put = false;
+                    rprintln!("Setting pitch roll to 0, 0");
+                }
+                rprintln!("[ctrl] update_position_control start");
+                ee.update_position_control(Some(angle1), Some(angle2), Some(dt));
+            });
+        }
+
+        // Light telemetry once per second (~50k cycles at 20 us)
+        *ctx.local.dbg_counter += 1;
+        if *ctx.local.dbg_counter >= 50_000 {
+            *ctx.local.dbg_counter = 0;
+            ctx.shared.end_effector.lock(|ee| {
+                rprintln!(
+                    "[dbg] TIM3 dt={:.6} motor1_enabled={} remaining_ticks={} motor2_enabled={} remaining_ticks={}",
+                    dt,
+                    ee.motor1.enabled,
+                    ee.motor1.remaining_ticks,
+                    ee.motor2.enabled,
+                    ee.motor2.remaining_ticks
+                );
+            });
+        }
 }
 
     // #[task(priority = 1, local = [i2c], shared = [encoder_value, encoders])]

@@ -77,8 +77,16 @@ pub struct As5600<I2C> {
     /// Number of full rotations (for multi-turn tracking)
     rotations: i32,
 
+    /// Exponential moving average of angle in degrees
+    filtered_angle_deg: f32,
+
+    /// Smoothing factor for the EMA (0 = no update, 1 = raw value)
+    filter_alpha: f32,
+
     /// Marker for I2C type parameter
     _phantom: core::marker::PhantomData<I2C>,
+
+    invert: bool,
 }
 
 impl<I2C> As5600<I2C>
@@ -93,15 +101,31 @@ where I2C: embedded_hal::i2c::I2c
             mux_channel,
             last_angle: 0,
             rotations: 0,
+            filtered_angle_deg: 0.0,
+            filter_alpha: 0.2, // default light smoothing
             _phantom: core::marker::PhantomData,
+            invert: false,
         }
     }
 
+    pub fn set_invert(&mut self, invert: bool) {
+        self.invert = invert;
+    }
 
     /// Get the multiplexer channel
     pub fn mux_channel(&self) -> u8 {
         self.mux_channel
-    }        
+    }
+
+    /// Invert rotation direction
+    pub fn invert(&mut self) {
+        self.invert = true;
+    }
+
+    /// Set smoothing factor for internal EMA (0 disables filtering, 1 bypasses smoothing)
+    pub fn set_filter_alpha(&mut self, alpha: f32) {
+        self.filter_alpha = alpha.clamp(0.0, 1.0);
+    }
 
     /// Read raw 12-bit angle (0-4095)
     ///
@@ -129,7 +153,8 @@ where I2C: embedded_hal::i2c::I2c
     pub fn read_angle_degrees(&mut self, i2c: &mut I2C) -> Result<f32, As5600Error>
     {
         let angle = self.read_angle(i2c)?;
-        Ok(angle as f32 * ENCODER_TO_DEGREES)
+        let degrees = angle as f32 * ENCODER_TO_DEGREES;
+        Ok(self.apply_filter(degrees))
     }
     
     /// Read angle in radians (0.0 - 2π)
@@ -205,13 +230,36 @@ where I2C: embedded_hal::i2c::I2c
         // Detect wraparound
         if diff < -(ENCODER_RESOLUTION as i32 / 2) {
             // Wrapped forward (0 -> 4095)
-            self.rotations += 1;
+            if self.invert {
+                self.rotations -= 1;
+            } else {
+                self.rotations += 1;
+            }
         } else if diff > (ENCODER_RESOLUTION as i32 / 2) {
             // Wrapped backward (4095 -> 0)
-            self.rotations -= 1;
+            if self.invert {
+                self.rotations += 1;
+            } else {
+                self.rotations -= 1;
+            }
         }
         
         self.last_angle = new_angle;
+    }
+
+    fn apply_filter(&mut self, sample_deg: f32) -> f32 {
+        if self.filter_alpha <= 0.0 {
+            return sample_deg;
+        }
+
+        if self.filtered_angle_deg == 0.0 {
+            self.filtered_angle_deg = sample_deg;
+            return sample_deg;
+        }
+
+        let alpha = self.filter_alpha;
+        self.filtered_angle_deg = self.filtered_angle_deg + alpha * (sample_deg - self.filtered_angle_deg);
+        self.filtered_angle_deg
     }
     
     /// Read 8-bit register
@@ -227,7 +275,6 @@ where I2C: embedded_hal::i2c::I2c
     fn read_u16(&mut self, i2c: &mut I2C, reg: u8) -> Result<u16, As5600Error>
     {
 
-        //TODO: add delays between mux selection and read if needed
         let mut buffer = [0u8; 2];
         i2c.write_read(AS5600_I2C_ADDR, &[reg], &mut buffer)
             .map_err(|_| As5600Error::I2cError)?;

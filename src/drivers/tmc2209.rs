@@ -2,6 +2,7 @@ use rtt_target::rprintln;
 use tmc2209::*;
 use crate::halfduplex::HalfDuplexSerial;
 
+#[derive(Clone, Copy, Debug)]
 pub enum TMCError {
     UARTError,
     TMCInternalError,
@@ -19,6 +20,7 @@ pub enum Register {
     TSTEP,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum MotorCommand {
     Configure(TMCConfig),
     SetCurrent(u16),
@@ -26,6 +28,7 @@ pub enum MotorCommand {
     GetStatus,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct MotorResponse {
     motor_id: u8,
     success: bool,
@@ -43,6 +46,7 @@ pub struct TmcResponse {
     success: bool
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct TMCConfig {
     enable_spreadcycle: bool,
     shaft_dir: bool,
@@ -51,6 +55,7 @@ pub struct TMCConfig {
     multistep_filt: bool,
    
 }
+
 
 pub struct TmcDriver {
     motor_id: u8,
@@ -220,6 +225,15 @@ impl TmcDriver {
                     motor_id: self.motor_id,
                     success: res.is_ok(),
                     status: res.as_ref().ok().cloned(),
+                    error: res.err(),
+                }
+            }
+            MotorCommand::SetMicrosteps(ms) => {
+                let res = self.set_microsteps(ms, uart);
+                MotorResponse {
+                    motor_id: self.motor_id,
+                    success: res.is_ok(),
+                    status: None,
                     error: res.err(),
                 }
             }
