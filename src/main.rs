@@ -142,8 +142,10 @@ mod app {
         let step_pin1 =  gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
         let dir_pin1 = gpiob.pb14.into_push_pull_output(&mut gpiob.crh).erase();
 
-        // let step_pin2 = gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
-        // let dir_pin2 = gpiob.pb14.into_push_pull_output(&mut gpiob.crh).erase();
+        //TODO: check the correct pins for motor 2
+
+        let step_pin2 = gpioa.pa0.into_push_pull_output(&mut gpioa.crl).erase();
+        let dir_pin2 = gpiob.pb9.into_push_pull_output(&mut gpiob.crh).erase();
 
         // let step_pin3 =gpioa.pa8.into_push_pull_output(&mut gpioa.crh).erase();
         // let dir_pin3 = gpiob.pb15.into_push_pull_output(&mut gpiob.crh).erase();
@@ -218,7 +220,7 @@ rprintln!("I2C live probe end");
 
             let mut m1 = MT::new(1,"motor 2", MotorType::Tmc(1), step_pin1, dir_pin1, cfg.clone(), 10, Some(1));
 
-            // let mut m2 = MT::new(2,"motor 3",MotorType::Tmc(2), step_pin2, dir_pin2, cfg.clone(), 20);
+            let mut m2 = MT::new(2,"motor 3",MotorType::Tmc(2), step_pin2, dir_pin2, cfg.clone(), 20, Some(2));
 
             // let mut m3 =MT::new(3,"motor 4",MotorType::Tmc(3), step_pin3, dir_pin3, cfg.clone(), 20);
 
@@ -229,9 +231,10 @@ rprintln!("I2C live probe end");
             // Initialize motors
             m0.init(500.0).unwrap();
             m1.init(500.0).unwrap();
+            m2.init(500.0).unwrap();
 
             // Create EndEffector - it owns the motors
-            let end_effector = EndEffector::new(m0, m1, pids[0 as usize].clone(), pids[1 as usize].clone(), 1.0, 1.0, ControlMode::Position(ControlLoop::Closed));
+            let end_effector = EndEffector::new(m0, m1, m2, pids[0 as usize].clone(), pids[1 as usize].clone(), pids[2 as usize].clone(), 1.0, 1.0, ControlMode::Position(ControlLoop::Closed));
 
 
 
@@ -346,9 +349,9 @@ rprintln!("I2C live probe end");
 
         // Tick all motors in the end effector
         ctx.shared.end_effector.lock(|ee| {
-            let [m1_step, m2_step] = ee.tick_motors();
-            if DEBUG_SPIN_MOTORS && (m1_step || m2_step) {
-                rprintln!("steps: m1={} m2={}", m1_step, m2_step);
+            let [m1_step, m2_step, m3_step] = ee.tick_motors();
+            if DEBUG_SPIN_MOTORS && (m1_step || m2_step || m3_step) {
+                rprintln!("steps: m1={} m2={} m3={}", m1_step, m2_step, m3_step);
             }
         })
     }
@@ -476,7 +479,7 @@ rprintln!("I2C live probe end");
                     rprintln!("Setting pitch roll to 0, 0");
                 }
                 rprintln!("[ctrl] update_position_control start");
-                ee.update_position_control(Some(angle1), Some(angle2), Some(dt));
+                ee.update_position_control(Some(angle1), Some(angle2),Some(0.0), Some(dt));
             });
         }
 
