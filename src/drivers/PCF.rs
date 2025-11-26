@@ -1,15 +1,15 @@
 
 
-use stm32f1xx_hal::gpio::{ErasedPin, Output, PushPull};
+use stm32f1xx_hal::gpio::{ErasedPin, Input, PushPull};
+use crate::config::PCF8574_I2C_ADDR;
 
-const PCF8574_I2C_ADDR: u8 = 0x20;
 pub enum PinMode {
     Input = 0,
     Output = 1,
 }
 pub struct pcf8574<I2C> {
     _phantom: core::marker::PhantomData<I2C>,
-    interrupt: ErasedPin<Output<PushPull>>,
+    // interrupt: ErasedPin<Input<PushPull>>,
     output_state: u8,
     address: u8,
 }
@@ -17,17 +17,17 @@ pub struct pcf8574<I2C> {
 impl <I2C> pcf8574<I2C> 
 where I2C: embedded_hal::i2c::I2c
 {
-    pub fn new(interrupt: ErasedPin<Output<PushPull>>, address: u8, i2c: &mut I2C) -> Self {
-
-        let mut dev = Self {
+    pub fn new(address: u8) -> Self {
+        Self {
             _phantom: core::marker::PhantomData,
-            interrupt,
+            // interrupt,
             output_state: 0xFF, // set all pins high (inputs)
             address,
-        };
+        }
+    }
 
-        dev.write(i2c).ok();
-        dev
+    pub fn init(&mut self, i2c: &mut I2C) -> Result<(), ()> {
+        self.write(i2c)
     }
 
     pub fn write(&mut self, i2c: &mut I2C) -> Result<(), ()> {
@@ -60,6 +60,17 @@ where I2C: embedded_hal::i2c::I2c
         let pins = self.read_pins(i2c)?;
         Ok((pins & (1 << pin)) != 0)
     }
+
+    // pub fn on_interrupt(&mut self, i2c: &mut I2C) -> Option<(u8, bool)> {
+    //     if self.interrupt.is_low() {
+    //         let pins = self.read_pins(i2c).ok()?;
+    //         if pins != self.output_state {
+    //             let pin_state = (pins & !(self.output_state)) & 0xFF;
+    //             return Some((pin_state, true));
+    //         }
+    //     }
+    //     None
+    // }
 }
 
 

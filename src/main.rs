@@ -3,6 +3,7 @@
 mod control;
 mod drivers;
 mod config;
+mod factories;
 
 use panic_rtt_target as _;
 use rtt_target::{rtt_init_print, rprintln};
@@ -64,6 +65,7 @@ mod app {
         encoder_value: LinearMap<u8, Queue<(f32, u16), 8>, 6>,
         encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6],
         end_effector: EndEffector,
+        limit_switch: crate::control::LimitSwitch::LimitSwitch::<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>,4>,
 
 
     }
@@ -109,6 +111,8 @@ mod app {
         let mut encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] = core::array::from_fn(|i| As5600::new(i as u8));
         encoders[1].set_invert(true);
         let pids: [control::pid::PidController; 6] = core::array::from_fn(|i| control::pid::PidController::new(1.0, 0.1, 0.1, i as u8));
+        let pcf = crate::drivers::PCF::pcf8574::<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>::new(crate::config::PCF8574_I2C_ADDR);
+        let switch = crate::control::LimitSwitch::LimitSwitch::<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>,4>::new(pcf);
 
         rtt_init_print!();
         rprintln!("=====initializing RTIC========");
@@ -369,6 +373,7 @@ rprintln!("I2C live probe end");
                 encoder_value,
                 encoders,
                 end_effector,
+                limit_switch,
 
             },
             Local {
@@ -434,6 +439,19 @@ rprintln!("I2C live probe end");
         }
         
     }
+    #[task(priority = 3, local = [homed:[bool; 4] = [false; 4] ], shared = [limit_switch, encoders, end_effector])]
+    async fn home_sequence(ctx: home_sequence::Context) {
+        rprintln!("home_sequence task started");
+
+        while (!ctx.local.homed.iter().all(|&h| h)) {
+            rprintln!("homing...");
+            ctx.shared.limit_switch.lock(|switch| {
+                switch.read_switches(ctx.local.i2c).unwrap();
+            })
+        }
+
+    }
+
     #[task(priority = 3, shared = [command_queue], local = [state: bool = true])]
     async fn command_sender(mut ctx: command_sender::Context) {
         rprintln!("command_sender task started");

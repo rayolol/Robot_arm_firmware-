@@ -186,6 +186,9 @@ pub const FEATURE_CURRENT_SENSING: bool = false;
 /// Enable homing sequence
 pub const FEATURE_HOMING: bool = false;
 
+pub const PCF8574_I2C_ADDR: u8 = 0x20;
+
+
 // ============================================================================
 // DEBUG CONFIGURATION
 // ============================================================================
