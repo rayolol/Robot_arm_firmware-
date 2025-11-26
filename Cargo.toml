@@ -22,10 +22,8 @@ panic-rtt-target = { version = "0.2.0" }
 embedded-hal = "1.0.0"
 rtic-sync = "1.4.0"
 libm = "0.2.15"
-serde = {version = "1", default-features = false, features = ["derive"] }
-postcard = {version = "1", default_features = false}
-crc-any = "2.5.0"
 embedded-io = "0.7.1"
+minicbor = { version = "2.1.1", features = ["derive"] }
 
 
 [profile.release]
@@ -33,4 +31,3 @@ codegen-units = 1
 debug = true
 lto = true
 opt-level = "z"
-

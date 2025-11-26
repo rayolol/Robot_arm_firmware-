@@ -1,5 +1,5 @@
 use rtt_target::rprintln;
-use crate::control::stepgen::stepgen::Stepgen;
+use crate::control::stepgen::stepgen::{Stepgen, Error as StepgenError};
 use stm32f1xx_hal::gpio::{ErasedPin, Output, PushPull};
 
 fn f32_to_fixed24_8(v: f32) -> i32 { (v * 256.0) as i32 }
@@ -8,6 +8,7 @@ fn fixed24_8_to_f32(raw: i32) -> f32 { raw as f32 / 256.0 }
 
 const MOTOR_DEBUG_MASK: u8 = 0b10; // enable verbose logging per motor bitmask (bit 0 -> motor 0, etc.)
 const STALL_CYCLE_THRESHOLD: u8 = 8;
+const DEBUG_VERBOSE: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MotorType { Tmc(u8), Tb6600 }
@@ -62,7 +63,8 @@ pub struct Motor {
 impl Motor {
     #[inline(always)]
     fn debug_enabled(&self) -> bool {
-        ((1u8 << self.id) & MOTOR_DEBUG_MASK) != 0
+        // ((1u8 << self.id) & MOTOR_DEBUG_MASK) != 0
+        false
     }
 
     pub fn new(
@@ -125,7 +127,9 @@ impl Motor {
         if motor_debug { rprintln!("[{}] set_velocity: {}", self.name, velocity); }
         // Check for NaN or infinite values
         if !velocity.is_finite() {
+            if DEBUG_VERBOSE {
             rprintln!("[{}] ERROR: velocity is NaN or infinite: {}", self.name, velocity);
+            }
             return Err(());
         }
 
@@ -137,7 +141,9 @@ impl Motor {
             if self.steps_emitted == self.last_command_step {
                 self.stall_cycles = self.stall_cycles.saturating_add(1);
                 if self.stall_cycles >= STALL_CYCLE_THRESHOLD {
-                    rprintln!("[{}] stall detected (no steps). Forcing re-prime.", self.name);
+                    if DEBUG_VERBOSE {
+                        rprintln!("[{}] stall detected (no steps). Forcing re-prime.", self.name);
+                    }
                     self.enabled = false;
                     self.interval_ticks = u32::MAX;
                 }
@@ -158,7 +164,9 @@ impl Motor {
         self.target = MotorTarget::Velocity(velocity_clamped);
 
         if already_running {
+            if DEBUG_VERBOSE {
             rprintln!("[{}] set_velocity: unchanged (delta {:.6})", self.name, velocity_delta);
+            }
             return Ok(());
         }
 
@@ -172,11 +180,21 @@ impl Motor {
         }
 
         // set target speed (check result)
-        if let Err(e) = self.ramp.set_target_speed(speed_fixed) {
-            rprintln!("[{}] set_target_speed ERROR: {:?}", self.name, e);
-            return Err(());
-        } else {
-            rprintln!("[{}] set_target_speed OK (fixed={})", self.name, speed_fixed);
+        match self.ramp.set_target_speed(speed_fixed) {
+            Ok(()) => {
+                rprintln!("[{}] set_target_speed OK (fixed={})", self.name, speed_fixed);
+            }
+            Err(StepgenError::TooSlow) => {
+                if motor_debug {
+                    rprintln!("[{}] target_speed TooSlow -> stop (fixed={})", self.name, speed_fixed);
+                }
+                self.stop();
+                return Ok(());
+            }
+            Err(e) => {
+                rprintln!("[{}] set_target_speed ERROR: {:?}", self.name, e);
+                return Err(());
+            }
         }
 
         let forward = velocity_clamped >= 0.0;
@@ -184,17 +202,23 @@ impl Motor {
 
         let need_prime = !self.enabled || self.interval_ticks == u32::MAX;
         if need_prime {
+            if DEBUG_VERBOSE {
             rprintln!("[{}] priming ramp", self.name);
-            // IMPORTANT: tell stepgen how far to run on first start only
+            }
+
             let run_forever_steps = u32::MAX / 4;
             if let Err(e) = self.ramp.set_target_step(run_forever_steps) {
-                rprintln!("[{}] set_target_step ERROR: {:?}", self.name, e);
+                if DEBUG_VERBOSE {
+                    rprintln!("[{}] set_target_step ERROR: {:?}", self.name, e);
+                }
             }
 
             // Prime the ramp: call next once so Stepgen computes initial delay/speed
             let delay = self.ramp.next().unwrap_or(0);
             if delay == 0 {
-                rprintln!("[{}] prime next() returned 0 — ramp not started", self.name);
+                if DEBUG_VERBOSE {
+                    rprintln!("[{}] prime next() returned 0 — ramp not started", self.name);
+                }
                 self.enabled = false;
                 self.interval_ticks = u32::MAX;
                 self.remaining_ticks = u32::MAX;
@@ -223,7 +247,9 @@ impl Motor {
         let delay = self.ramp.next().unwrap_or(0);
 
         if delay == 0 {
-            rprintln!("[{}] update_from_ramp: next() -> 0 (stopped or not configured)", self.name);
+            if DEBUG_VERBOSE {
+                rprintln!("[{}] update_from_ramp: next() -> 0 (stopped or not configured)", self.name);
+            }
             self.enabled = false;
             self.interval_ticks = u32::MAX;
             self.remaining_ticks = u32::MAX;
@@ -233,7 +259,9 @@ impl Motor {
         // delay is 16.8 fixed representing ticks. Convert to ticks integer:
         let delay_ticks = delay >> 8; // number of Stepgen ticks per step
         if delay_ticks == 0 {
-            rprintln!("[{}] update_from_ramp: delay_ticks == 0 (too fast)", self.name);
+            if DEBUG_VERBOSE {
+                rprintln!("[{}] update_from_ramp: delay_ticks == 0 (too fast)", self.name);
+            }
             self.enabled = false;
             return false;
         }

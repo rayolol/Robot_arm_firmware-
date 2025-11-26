@@ -83,6 +83,9 @@ pub struct As5600<I2C> {
     /// Smoothing factor for the EMA (0 = no update, 1 = raw value)
     filter_alpha: f32,
 
+    /// Stored zero offset for centered readings
+    zero_offset_deg: Option<f32>,
+
     /// Marker for I2C type parameter
     _phantom: core::marker::PhantomData<I2C>,
 
@@ -103,6 +106,7 @@ where I2C: embedded_hal::i2c::I2c
             rotations: 0,
             filtered_angle_deg: 0.0,
             filter_alpha: 0.2, // default light smoothing
+            zero_offset_deg: None,
             _phantom: core::marker::PhantomData,
             invert: false,
         }
@@ -135,6 +139,18 @@ where I2C: embedded_hal::i2c::I2c
     {
         self.read_u16(i2c, register::RAW_ANGLE)
     }
+
+    pub fn read_unwrapped_degrees(&mut self, i2c: &mut I2C) -> Result<f32, As5600Error> {
+        let angle = self.read_angle(i2c)?;
+        let base = angle as f32 * ENCODER_TO_DEGREES;
+        let total = if self.invert {
+            -((self.rotations as f32 * 360.0) + base)
+        } else {
+            (self.rotations as f32 * 360.0) + base
+        };
+        Ok(self.apply_filter(total))
+    }
+
     
     /// Read filtered 12-bit angle (0-4095)
     /// 
@@ -153,8 +169,26 @@ where I2C: embedded_hal::i2c::I2c
     pub fn read_angle_degrees(&mut self, i2c: &mut I2C) -> Result<f32, As5600Error>
     {
         let angle = self.read_angle(i2c)?;
-        let degrees = angle as f32 * ENCODER_TO_DEGREES;
+        let mut degrees = angle as f32 * ENCODER_TO_DEGREES;
+        if self.invert {
+            degrees = 360.0 - degrees;
+        }
         Ok(self.apply_filter(degrees))
+    }
+
+    /// Read angle referenced to stored zero offset and normalized to [-180, 180]
+    pub fn read_zeroed_degrees(&mut self, i2c: &mut I2C) -> Result<f32, As5600Error> {
+        // Use the unwrapped reading so we don't introduce large jumps when the encoder
+        // crosses the 0°/360° boundary. Filtering happens on the monotonic angle, then we
+        // wrap it back into [-180°, 180°] for the caller.
+        let degrees = self.read_unwrapped_degrees(i2c)?;
+        let zero = if let Some(z) = self.zero_offset_deg {
+            z
+        } else {
+            self.zero_offset_deg = Some(degrees);
+            degrees
+        };
+        Ok(degrees - zero)
     }
     
     /// Read angle in radians (0.0 - 2π)
@@ -167,6 +201,20 @@ where I2C: embedded_hal::i2c::I2c
     /// Get total rotations including multi-turn tracking
     pub fn total_angle_degrees(&self) -> f32 {
         (self.rotations as f32 * 360.0) + (self.last_angle as f32 * ENCODER_TO_DEGREES)
+    }
+
+    /// Capture the current position as the zero reference.
+    pub fn zero_current_position(&mut self, i2c: &mut I2C) -> Result<(), As5600Error> {
+        let angle = self.read_angle(i2c)?;
+        let mut degrees = angle as f32 * ENCODER_TO_DEGREES;
+        if self.invert {
+            degrees = 360.0 - degrees;
+        }
+        self.zero_offset_deg = Some(degrees);
+        self.rotations = 0;
+        self.last_angle = angle;
+        self.filtered_angle_deg = 0.0;
+        Ok(())
     }
     
     /// Read magnet status
@@ -260,6 +308,16 @@ where I2C: embedded_hal::i2c::I2c
         let alpha = self.filter_alpha;
         self.filtered_angle_deg = self.filtered_angle_deg + alpha * (sample_deg - self.filtered_angle_deg);
         self.filtered_angle_deg
+    }
+
+    fn normalize_angle(mut angle: f32) -> f32 {
+        while angle > 180.0 {
+            angle -= 360.0;
+        }
+        while angle < -180.0 {
+            angle += 360.0;
+        }
+        angle
     }
     
     /// Read 8-bit register
