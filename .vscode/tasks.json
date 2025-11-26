@@ -1,0 +1,18 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+           
+            "label": "probe-run",
+            "type": "shell",
+            "command": "probe-rs run --chip STM32F103C8 target/thumbv7m-none-eabi/release/robot-arm-firmware",
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}
