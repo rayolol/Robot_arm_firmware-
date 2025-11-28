@@ -7,29 +7,32 @@ use stm32f1xx_hal::{
     gpio::{ErasedPin},
 };
 use stm32f1xx_hal::{self as hal, afio};
+use rtic_sync::{channel::*, make_channel};
 
-use crate::drivers::TMC2209::TmcDriver;
+use crate::drivers::TMC2209::{TmcDriver, MotorCommand, MotorResponse};
 use crate::drivers::AS6500::As5600;
 use crate::drivers::PCF::pcf8574;
 use crate::control::LimitSwitch::LimitSwitch;
 use crate::control::pid::PidController;
 use crate::drivers::TCA::TCA9548A;
 use crate::control::motor::{Motor as MT, MotorType, MotorConfig};
+use crate::halfduplex::HalfDuplexSerial;
 
-
-
-pub fn make_peripherals() -> ([TmcDriver; 4], [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6], [PidController; 6], LimitSwitch<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>,4>) {
-    let mut drivers: [TmcDriver; 4] = core::array::from_fn(|i| TmcDriver::new(i as u8, 200, 256));
-
-    let mut encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] = core::array::from_fn(|i| As5600::new(i as u8));
-    let pids: [PidController; 6] = core::array::from_fn(|i| PidController::new(1.0, 0.1, 0.1, i as u8));
-    let pcf = crate::drivers::PCF::pcf8574::<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>::new(crate::config::PCF8574_I2C_ADDR);
-    let switch = crate::control::LimitSwitch::LimitSwitch::<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>,4>::new(pcf);
-    let mut tca: TCA9548A<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>> = TCA9548A::new(rst_mux);
-
-
-    (drivers, encoders, pids, switch)
+struct I2cBus {
+    i2c: I2c<pac::I2C1>,
+    tca: TCA9548A<I2c<pac::I2C1>>,
 }
+
+struct TmcClient {
+    command_rx: Receiver<'static, (u8, MotorCommand), 8>,
+    response_tx: Sender<'static, (u8, MotorResponse), 8>,
+}
+
+struct TmcServer {
+    command_tx: Sender<'static, (u8, MotorCommand), 8>,
+    response_rx: Receiver<'static, (u8, MotorResponse), 8>,
+}
+
 
 pub fn make_gpio(gpioa: pac::GPIOA, gpiob: pac::GPIOB, gpioc: pac::GPIOC, afio: pac::AFIO, rcc: &mut rcc::Rcc) -> (gpioa::Parts, gpiob::Parts, gpioc::Parts, afio::Parts) {
     let mut gpioa = gpioa.split(rcc);
@@ -39,18 +42,55 @@ pub fn make_gpio(gpioa: pac::GPIOA, gpiob: pac::GPIOB, gpioc: pac::GPIOC, afio: 
     (gpioa, gpiob, gpioc, afio)
 }
 
-pub fn setup_i2c(i2c: pac::I2c1,scl: gpiob::PB6<gpio::Alternate<gpio::OpenDrain>>, sda: gpiob::PB7<gpio::Alternate<gpio::OpenDrain>>,rst_mux: gpiob::PB5<gpio::Output<gpio::PushPull>>, rcc: &mut rcc::Rcc) {
+pub fn setup_i2c(i2c: pac::I2C1,scl: gpiob::PB6<hal::gpio::Alternate<hal::gpio::OpenDrain>>, sda: gpiob::PB7<hal::gpio::Alternate<hal::gpio::OpenDrain>>,rst_mux: ErasedPin<Output>, rcc: &mut rcc::Rcc) -> I2cBus {
     let mut i2c = I2c::new(i2c, (scl, sda), Mode::Standard { frequency: 10u32.kHz().into() }, rcc);
     let mut tca: TCA9548A<stm32f1xx_hal::i2c::I2c<pac::I2C1>> = TCA9548A::new(rst_mux);
 
-    (i2c, tca)
+    I2cBus {i2c, tca}
 }
+
+pub fn setup_tmc_uart(delay: stm32f1xx_hal::timer::DelayUs<pac::TIM4>) -> HalfDuplexSerial {
+    let apb1enr = unsafe { &(*pac::RCC::ptr()).apb1enr() };
+    apb1enr.modify(|_, w| w.usart3en().set_bit());
+
+    // Configure baud rate manually (must do before HalfDuplexSerial::new enables USART)
+    let usart3 = unsafe { &*pac::USART3::ptr() };
+    // BRR = PCLK1/baudrate = 36,000,000/9600 = 3750
+    usart3.brr().write(|w| unsafe { w.bits(3750) });
+
+    let half_serial =HalfDuplexSerial::new(100000, delay);
+
+    half_serial
+}
+
+pub fn tmc_stack() -> ([TmcDriver; 4], TmcClient, TmcServer) {
+
+    let (command_tx, command_rx) = make_channel!((u8, MotorCommand), 8);
+    let (response_tx, response_rx) = make_channel!((u8, MotorResponse), 8);
+
+    let mut drivers: [TmcDriver; 4] = core::array::from_fn(|i| TmcDriver::new(i as u8, 200, 256));
+    for driver in drivers.iter_mut() {
+        driver.enable().unwrap();
+    }
+
+    (drivers, TmcClient { command_rx, response_tx }, TmcServer { command_tx, response_rx })
+}
+pub fn make_encoders() -> [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] {
+    let encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] = core::array::from_fn(|i| As5600::new(i as u8));
+    encoders
+}
+
 
 pub fn setup_master_serial() {
   
 }
 
-pub fn make_pins(mut gpiob: gpiob::Parts, mut gpioa: gpioa::Parts, mut gpioc: gpioc::Parts) -> [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPull>>); 6] {
+
+//TODO: rework this
+pub fn make_pins(mut afio: afio::Parts, mut gpiob: gpiob::Parts, mut gpioa: gpioa::Parts, mut gpioc: gpioc::Parts) -> [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPull>>); 6] {
+
+    let (pa15, pb3, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+
     let step_pin0 = gpiob.pb1.into_push_pull_output(&mut gpiob.crl).erase();
     let dir_pin0 = gpiob.pb12.into_push_pull_output(&mut gpiob.crh).erase();
 
@@ -64,10 +104,12 @@ pub fn make_pins(mut gpiob: gpiob::Parts, mut gpioa: gpioa::Parts, mut gpioc: gp
     let dir_pin3 = gpiob.pb13.into_push_pull_output(&mut gpiob.crh).erase();
 
     let step_pin4 = gpiob.pb8.into_push_pull_output(&mut gpiob.crh).erase();
-    let dir_pin4 = gpiob.pb3.into_push_pull_output(&mut gpiob.crl).erase();
+    let dir_pin4 = pb3.into_push_pull_output(&mut gpiob.crl).erase();
 
     let step_pin5 = gpiob.pb9.into_push_pull_output(&mut gpiob.crh).erase();
-    let dir_pin5 = gpiob.pb4.into_push_pull_output(&mut gpiob.crl).erase();
+    let dir_pin5 = pb4.into_push_pull_output(&mut gpiob.crl).erase();
+
+    
 
     let pins = [
         (step_pin0, dir_pin0),
@@ -81,7 +123,7 @@ pub fn make_pins(mut gpiob: gpiob::Parts, mut gpioa: gpioa::Parts, mut gpioc: gp
     pins
 }
 
-
+// TODO: rework this
 pub fn make_motors(pins : [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPull>>); 6]) -> [MT; 6] {
     const MOTOR_NAMES: [&str; 6] = ["motor 0", "motor 1", "motor 2", "motor 3", "motor 4", "motor 5"];
     let cfg = MotorConfig::default();
@@ -123,15 +165,15 @@ pub fn setup_clocks(flash: pac::FLASH, rcc: pac::RCC) -> (hal::flash::Parts, hal
 }
 
 pub fn setup_timers(tim2: pac::TIM2, tim3: pac::TIM3, tim4: pac::TIM4, rcc: &mut rcc::Rcc) -> (hal::timer::CounterUs<pac::TIM2>, hal::timer::CounterUs<pac::TIM3>, hal::timer::DelayUs<pac::TIM4>) {
-    let mut timer2 = tim2.counter_us(&mut rcc);
+    let mut timer2 = tim2.counter_us(rcc);
     timer2.start(10.micros());
     timer2.listen(Event::Update);
 
-    let mut timer3 = tim3.counter_us(&mut rcc);
+    let mut timer3 = tim3.counter_us(rcc);
     timer3.start(1000.micros());
     timer3.listen(Event::Update);
 
-    let delay = tim4.delay_us(&mut rcc);
+    let delay = tim4.delay_us(rcc);
 
     (timer2, timer3, delay)
 }

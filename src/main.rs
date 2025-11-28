@@ -132,7 +132,7 @@ mod app {
 
         let rst_mux = gpiob.pb5.into_push_pull_output(&mut gpiob.crl).erase();
 
-            let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
+        let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
         let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
         let mut i2c = I2c::new(ctx.device.I2C1, (scl, sda), Mode::Standard { frequency: 10u32.kHz().into() }, &mut rcc);
 
