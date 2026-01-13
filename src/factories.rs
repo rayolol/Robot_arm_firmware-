@@ -1,50 +1,66 @@
-use stm32f1xx_hal::gpio::{gpiob, gpioa, gpioc, Output, PushPull};
+use stm32f1xx_hal::gpio::{OpenDrain, Output, PushPull, gpioa, gpiob, gpioc};
 use stm32f1xx_hal::{
     pac, rcc, prelude::*,
     timer::{Event},
     i2c::{I2c, Mode},
     serial::{Serial, Config, Rx, Tx},
-    gpio::{ErasedPin},
+    gpio::{ErasedPin, Alternate},
 };
 use stm32f1xx_hal::{self as hal, afio};
 use rtic_sync::{channel::*, make_channel};
 
+use crate::config;
 use crate::drivers::TMC2209::{TmcDriver, MotorCommand, MotorResponse};
 use crate::drivers::AS6500::As5600;
 use crate::drivers::PCF::pcf8574;
-use crate::control::LimitSwitch::LimitSwitch;
+use crate::control::limit_switch::LimitSwitch;
 use crate::control::pid::PidController;
 use crate::drivers::TCA::TCA9548A;
 use crate::control::motor::{Motor as MT, MotorType, MotorConfig};
 use crate::halfduplex::HalfDuplexSerial;
+use crate::control::joint::Joint;
+use crate::config::Encoder;
 
-struct I2cBus {
-    i2c: I2c<pac::I2C1>,
-    tca: TCA9548A<I2c<pac::I2C1>>,
+pub struct PinsAndI2c {
+    pub step_dir: [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPull>>); 6],
+    pub rst_mux: ErasedPin<Output<PushPull>>,
+    pub scl: gpiob::PB6<Alternate<OpenDrain>>,
+    pub sda: gpiob::PB7<Alternate<OpenDrain>>,
 }
 
-struct TmcClient {
+pub struct I2cBus {
+    pub i2c: I2c<pac::I2C1>,
+    pub tca: TCA9548A<I2c<pac::I2C1>>,
+}
+
+pub struct TmcClient {
     command_rx: Receiver<'static, (u8, MotorCommand), 8>,
     response_tx: Sender<'static, (u8, MotorResponse), 8>,
 }
 
-struct TmcServer {
+pub struct TmcServer {
     command_tx: Sender<'static, (u8, MotorCommand), 8>,
     response_rx: Receiver<'static, (u8, MotorResponse), 8>,
 }
 
 
 pub fn make_gpio(gpioa: pac::GPIOA, gpiob: pac::GPIOB, gpioc: pac::GPIOC, afio: pac::AFIO, rcc: &mut rcc::Rcc) -> (gpioa::Parts, gpiob::Parts, gpioc::Parts, afio::Parts) {
-    let mut gpioa = gpioa.split(rcc);
-    let mut gpiob = gpiob.split(rcc);
-    let mut gpioc = gpioc.split(rcc);
-    let mut afio = afio.constrain(rcc);
+    let gpioa = gpioa.split(rcc);
+    let gpiob = gpiob.split(rcc);
+    let gpioc = gpioc.split(rcc);
+    let afio = afio.constrain(rcc);
     (gpioa, gpiob, gpioc, afio)
 }
 
-pub fn setup_i2c(i2c: pac::I2C1,scl: gpiob::PB6<hal::gpio::Alternate<hal::gpio::OpenDrain>>, sda: gpiob::PB7<hal::gpio::Alternate<hal::gpio::OpenDrain>>,rst_mux: ErasedPin<Output>, rcc: &mut rcc::Rcc) -> I2cBus {
-    let mut i2c = I2c::new(i2c, (scl, sda), Mode::Standard { frequency: 10u32.kHz().into() }, rcc);
-    let mut tca: TCA9548A<stm32f1xx_hal::i2c::I2c<pac::I2C1>> = TCA9548A::new(rst_mux);
+pub fn setup_i2c(
+    i2c: pac::I2C1,
+    scl: gpiob::PB6<Alternate<OpenDrain>>,
+    sda: gpiob::PB7<Alternate<OpenDrain>>,
+    rst_mux: ErasedPin<Output<PushPull>>,
+    rcc: &mut rcc::Rcc,
+) -> I2cBus {
+    let i2c = I2c::new(i2c, (scl, sda), Mode::Standard { frequency: 10u32.kHz().into() }, rcc);
+    let tca: TCA9548A<stm32f1xx_hal::i2c::I2c<pac::I2C1>> = TCA9548A::new(rst_mux);
 
     I2cBus {i2c, tca}
 }
@@ -75,9 +91,11 @@ pub fn tmc_stack() -> ([TmcDriver; 4], TmcClient, TmcServer) {
 
     (drivers, TmcClient { command_rx, response_tx }, TmcServer { command_tx, response_rx })
 }
-pub fn make_encoders() -> [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] {
-    let encoders: [As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>; 6] = core::array::from_fn(|i| As5600::new(i as u8));
-    encoders
+pub fn make_encoders(tca_channel: u8) -> ([Encoder; 3], LimitSwitch<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>, 4>, [PidController; 3]) {
+    let pid: [PidController; 3] = core::array::from_fn(|i| PidController::new(1.0, 0.1, 0.1, i as u8));
+    let encoders: [Encoder; 3] = core::array::from_fn(|i| As5600::new(i as u8));
+    let limit_switch = LimitSwitch::new(pcf8574::new(crate::config::PCF8574_I2C_ADDR, tca_channel));
+    (encoders, limit_switch, pid)
 }
 
 
@@ -87,14 +105,18 @@ pub fn setup_master_serial() {
 
 
 //TODO: rework this
-pub fn make_pins(mut afio: afio::Parts, mut gpiob: gpiob::Parts, mut gpioa: gpioa::Parts, mut gpioc: gpioc::Parts) -> [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPull>>); 6] {
+pub fn make_pins(mut afio: afio::Parts, mut gpiob: gpiob::Parts, mut gpioa: gpioa::Parts) -> PinsAndI2c {
 
-    let (pa15, pb3, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+    let (_pa15, _pb3, _pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+
+    let rst_mux = gpiob.pb5.into_push_pull_output(&mut gpiob.crl).erase();
+    let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
+    let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
 
     let step_pin0 = gpiob.pb1.into_push_pull_output(&mut gpiob.crl).erase();
     let dir_pin0 = gpiob.pb12.into_push_pull_output(&mut gpiob.crh).erase();
 
-    let step_pin1 = gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
+    let step_pin1 =  gpioa.pa1.into_push_pull_output(&mut gpioa.crl).erase();
     let dir_pin1 = gpiob.pb14.into_push_pull_output(&mut gpiob.crh).erase();
 
     let step_pin2 = gpioa.pa8.into_push_pull_output(&mut gpioa.crh).erase();
@@ -104,10 +126,10 @@ pub fn make_pins(mut afio: afio::Parts, mut gpiob: gpiob::Parts, mut gpioa: gpio
     let dir_pin3 = gpiob.pb13.into_push_pull_output(&mut gpiob.crh).erase();
 
     let step_pin4 = gpiob.pb8.into_push_pull_output(&mut gpiob.crh).erase();
-    let dir_pin4 = pb3.into_push_pull_output(&mut gpiob.crl).erase();
+    let dir_pin4 = _pb3.into_push_pull_output(&mut gpiob.crl).erase();
 
     let step_pin5 = gpiob.pb9.into_push_pull_output(&mut gpiob.crh).erase();
-    let dir_pin5 = pb4.into_push_pull_output(&mut gpiob.crl).erase();
+    let dir_pin5 = _pb4.into_push_pull_output(&mut gpiob.crl).erase();
 
     
 
@@ -120,7 +142,7 @@ pub fn make_pins(mut afio: afio::Parts, mut gpiob: gpiob::Parts, mut gpioa: gpio
         (step_pin5, dir_pin5),
     ];
 
-    pins
+    PinsAndI2c { step_dir: pins, rst_mux, scl, sda }
 }
 
 // TODO: rework this
@@ -137,12 +159,12 @@ pub fn make_motors(pins : [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPu
         MT::new(
             i as u8,
             MOTOR_NAMES[i],
-            if i < 4 { MotorType::Tmc(i as u8) } else { MotorType::Tb6600 },
+            MotorType::Tmc(i as u8),
             step_pin,
             dir_pin,
             MotorConfig { direction_inverted: true, ..cfg },
             10,
-            if i < 5 { Some(i as u8) } else { None },
+            Some(i as u8),
         )
     });
 
@@ -151,6 +173,24 @@ pub fn make_motors(pins : [(ErasedPin<Output<PushPull>>, ErasedPin<Output<PushPu
     }
 
     motors
+}
+
+pub fn make_joints(
+    motors: [MT; 6],
+    encoders: Option<[Encoder; 6]>,
+    pids: Option<[PidController; 6]>,
+    stages: [Option<f32>; 6],
+) -> [Joint; 6] {
+    let mut motor_iter = motors.into_iter();
+    let mut enc_iter = encoders.map(|arr| arr.into_iter());
+    let mut pid_iter = pids.map(|arr| arr.into_iter());
+
+    core::array::from_fn(|i| {
+        let motor = motor_iter.next().expect("6 motors");
+        let enc = enc_iter.as_mut().and_then(|it| it.next());
+        let pid = pid_iter.as_mut().and_then(|it| it.next());
+        Joint::new(i, motor.name, motor, enc, pid, stages[i])
+    })
 }
 
 pub fn setup_clocks(flash: pac::FLASH, rcc: pac::RCC) -> (hal::flash::Parts, hal::rcc::Rcc) {
@@ -177,4 +217,3 @@ pub fn setup_timers(tim2: pac::TIM2, tim3: pac::TIM3, tim4: pac::TIM4, rcc: &mut
 
     (timer2, timer3, delay)
 }
-

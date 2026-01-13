@@ -12,17 +12,19 @@ pub struct pcf8574<I2C> {
     // interrupt: ErasedPin<Input<PushPull>>,
     output_state: u8,
     address: u8,
+    tca_channel: u8,
 }
 
 impl <I2C> pcf8574<I2C> 
 where I2C: embedded_hal::i2c::I2c
 {
-    pub fn new(address: u8) -> Self {
+    pub fn new(address: u8, tca_channel: u8) -> Self {
         Self {
             _phantom: core::marker::PhantomData,
             // interrupt,
             output_state: 0xFF, // set all pins high (inputs)
             address,
+            tca_channel,
         }
     }
 

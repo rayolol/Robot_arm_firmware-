@@ -61,12 +61,26 @@ pub enum MagnetStatus {
 // ============================================================================
 // AS5600 DRIVER
 // ============================================================================
-
+impl<I2C> Clone for As5600<I2C> {
+    fn clone(&self) -> Self {
+        Self {
+            mux_channel: self.mux_channel,
+            last_angle: self.last_angle,
+            rotations: self.rotations,
+            filtered_angle_deg: self.filtered_angle_deg,
+            filter_alpha: self.filter_alpha,
+            zero_offset_deg: self.zero_offset_deg,
+            _phantom: core::marker::PhantomData,
+            invert: self.invert,
+        }
+    }
+}
 /// AS5600 magnetic rotary encoder driver
 ///
 /// The AS5600 provides 12-bit absolute angle measurement.
 /// Communication is via I2C, typically through a multiplexer
 /// when using multiple encoders.
+#[derive(PartialEq)]
 pub struct As5600<I2C> {
     /// Multiplexer channel this encoder is on
     mux_channel: u8,

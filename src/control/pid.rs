@@ -1,5 +1,5 @@
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct PidController {
     id: u8,
     kp: f32,

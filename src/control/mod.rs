@@ -5,4 +5,6 @@ pub mod pid;
 pub mod parts;
 pub mod utils;
 
-pub mod LimitSwitch;
+pub mod limit_switch;
+pub mod joint;
+pub mod openloop;

@@ -17,7 +17,7 @@ heapless = "0.9.1"
 nb = "1.0" 
 
 
-rtt-target = { version = "0.6.1"}
+rtt-target = { version = "0.6.1", default-features = false}
 panic-rtt-target = { version = "0.2.0" }
 embedded-hal = "1.0.0"
 rtic-sync = "1.4.0"

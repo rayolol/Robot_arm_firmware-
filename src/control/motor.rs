@@ -32,7 +32,6 @@ impl Default for MotorConfig {
         Self { steps_per_rev: 200, microsteps: 16, max_velocity: 500.0, direction_inverted: false }
     }
 }
-
 pub struct Motor {
     pub id: u8,
     pub name: &'static str,

@@ -188,6 +188,7 @@ pub const FEATURE_HOMING: bool = false;
 
 pub const PCF8574_I2C_ADDR: u8 = 0x20;
 
+pub type Encoder = crate::As5600<stm32f1xx_hal::i2c::I2c<stm32f1xx_hal::pac::I2C1>>;
 
 // ============================================================================
 // DEBUG CONFIGURATION
